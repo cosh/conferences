@@ -1,0 +1,56 @@
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.project
+.classpath
+.settings/
+
+# Temporary Files
+*.tmp
+*.temp
+*.log
+*.bak
+*.old
+
+# Build and Distribution
+dist/
+build/
+*.pyc
+*.pyo
+__pycache__/
+node_modules/
+*.egg-info/
+.eggs/
+
+# Compiled Files
+*.class
+*.o
+*.so
+*.exe
+*.dll
+
+# Archives (optional - uncomment if you don't want to track compiled archives)
+# *.zip
+# *.tar.gz
+# *.rar
+# *.7z
+
+# Local environment files
+.env
+.env.local
+venv/
+env/
+ENV/
