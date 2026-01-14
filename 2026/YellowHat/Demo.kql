@@ -1,0 +1,205 @@
+/// DEMO 1 - Data available in advanced hunting
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEMO QUERY 1.1: Find attack paths from internet-exposed to high-value assets
+// ═══════════════════════════════════════════════════════════════════════════
+ExposureGraphEdges
+| make-graph SourceNodeId --> TargetNodeId with ExposureGraphNodes on NodeId
+| graph-match (exposed)-[e*1..4]->(critical)
+    where exposed.NodeProperties has "ExposedToInternet"
+      and critical.NodeProperties has "HighValueAsset"
+    project
+        ExposedAsset = exposed.NodeName,
+        ExposedType = exposed.NodeLabel,
+        CriticalAsset = critical.NodeName,
+        CriticalType = critical.NodeLabel,
+        PathLength = array_length(e)
+| order by PathLength asc
+
+/// DEMO 2 - Combining Algebras: Spike + Blast Radius
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 1: GENERATE REALISTIC ACTIVITY DATA (60 days of normal user behavior)
+// ═══════════════════════════════════════════════════════════════════════════
+let detectStart = datetime(2022-04-30 05:00);
+let trainStart = datetime(2022-03-01 05:00);
+let names = pack_array("Admin", "Dev1", "Dev2", "IT-support");  // Normal users
+let ActivityLogs = range t from 1 to 24*60+3 step 1             // 60 days + 3 hours
+    | extend timeSlice = trainStart + 1h * t
+    | extend countEvents = round(2*rand() + iff((t/24)%7>=5, 10.0, 15.0) - (((t%24)/10)*((t%24)/10)), 2) * 100
+    | extend userName = tostring(names[toint(rand(array_length(names)))])
+    | extend accountName = iff(rand() < 0.2 and timeSlice < detectStart, 'test', 'prod')
+    // ═══ INJECT ATTACKERS: 3 suspicious users with 5x activity spikes ═══
+    | extend userName = iff(timeSlice == detectStart, 'H4ck3r', userName)
+    | extend userName = iff(timeSlice == detectStart + 1h, 'Malware_Bot', userName)
+    | extend userName = iff(timeSlice == detectStart + 2h, 'Rogue_Admin', userName)
+    | extend countEvents = iff(timeSlice in (detectStart, detectStart + 1h, detectStart + 2h), 5*countEvents, countEvents);
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 2: DEFINE ACCESS GRAPH EDGES (who can reach what, with edge IDs)
+// ═══════════════════════════════════════════════════════════════════════════
+let edges = datatable(src:string, edgeId:string, tgt:string, scope:string) [
+    'H4ck3r', 'e1', 'jump-srv', 'prod',  'jump-srv', 'e2', 'dc01', 'prod',
+    'H4ck3r', 'e3', 'app-srv', 'prod',   'app-srv', 'e4', 'db-prod', 'prod',
+    'H4ck3r', 'e5', 'backup-agent', 'prod', 'backup-agent', 'e6', 'storage_main_backup', 'prod',
+    'Malware_Bot', 'e7', 'webapp-prd', 'prod', 'webapp-prd', 'e8', 'hub_router', 'prod',
+    'Rogue_Admin', 'e9', 'admin-ws', 'prod', 'admin-ws', 'e10', 'dc01', 'prod',
+    'Admin', 'e11', 'dc01', 'prod', 'Dev1', 'e12', 'db-dev', 'prod'
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 3: DEFINE NODES (mark valid path starts/ends and criticality)
+// ═══════════════════════════════════════════════════════════════════════════
+let nodes = datatable(nodeId:string, nodeType:string, crit:int, scope:string) [
+    'H4ck3r', 'user', 0, 'prod', 'Malware_Bot', 'user', 0, 'prod', 'Rogue_Admin', 'user', 0, 'prod',
+    'Admin', 'user', 0, 'prod', 'Dev1', 'user', 0, 'prod',
+    'jump-srv', 'server', 2, 'prod', 'app-srv', 'server', 2, 'prod', 'admin-ws', 'workstation', 1, 'prod',
+    'backup-agent', 'service', 2, 'prod', 'webapp-prd', 'app', 3, 'prod',
+    'dc01', 'dc', 5, 'prod', 'db-prod', 'database', 5, 'prod', 'db-dev', 'database', 1, 'prod',
+    'storage_main_backup', 'storage', 5, 'prod', 'hub_router', 'network', 2, 'prod'
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 4: STATISTICAL ALGEBRA - Find users with anomalous activity spikes
+// ═══════════════════════════════════════════════════════════════════════════
+let suspicious = ActivityLogs
+    | invoke detect_anomalous_spike_fl('countEvents','userName','accountName','timeSlice',
+        trainStart, detectStart, detectStart + 3h)
+    | distinct entity;
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 5: ENRICH NODES - Mark suspicious users as valid path starts, critical assets as ends
+// ═══════════════════════════════════════════════════════════════════════════
+let nodesEnriched = nodes
+    | extend IsValidStart = nodeId in (suspicious)
+    | extend IsValidEnd = crit >= 5;  // DC, database, storage are critical
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 6: GRAPH ALGEBRA - Discover paths, then calculate blast radius
+// ═══════════════════════════════════════════════════════════════════════════
+graph_path_discovery_fl('edges', 'nodesEnriched', 'scope',
+    'IsValidStart', 'IsValidEnd', 'nodeId', 'edgeId', 'src', 'tgt')
+| invoke graph_blast_radius_fl('sourceId', 'targetId')
+| project sourceId, blastRadiusList, blastRadiusScore
+| order by blastRadiusScore desc
+
+///DEMO 3
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 1: GENERATE USER-RESOURCE ACCESS DATA (60 days of normal access patterns)
+// ═══════════════════════════════════════════════════════════════════════════
+let detectStart = datetime(2022-04-30 05:00);
+let trainStart = datetime(2022-03-01 05:00);
+let users = pack_array("Admin", "Dev1", "Dev2", "IT-support");
+let devices = toscalar(range i from 1 to 51 step 1
+    | extend d = strcat("device", tostring(i)) | summarize make_list(d));
+let countDevices = array_length(devices) - 1;
+let AccessLogs = range t from 0 to 24*60 step 1
+    | extend timeSlice = trainStart + 1h * t
+    | extend userName = tostring(users[toint(rand(array_length(users)))])
+    | extend deviceId = tostring(devices[toint(rand(countDevices))])
+    | extend accountName = iff(rand() < 0.2 and timeSlice < detectStart, 'test', 'prod')
+    // ═══ INJECT H4ck3r at trainStart: baseline access to device1 ═══
+    | extend userName = iff(timeSlice == trainStart, 'H4ck3r', userName)
+    | extend deviceId = iff(timeSlice == trainStart, 'device1', deviceId)
+    | extend accountName = iff(timeSlice == trainStart, 'prod', accountName)
+    // ═══ INJECT H4ck3r at detectStart: anomalous access to device50 ═══
+    | extend userName = iff(timeSlice == detectStart, 'H4ck3r', userName)
+    | extend deviceId = iff(timeSlice == detectStart, 'device50', deviceId)
+    | extend accountName = iff(timeSlice == detectStart, 'prod', accountName);
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 2: DEFINE EXPOSURE GRAPH EDGES (attack paths to resources)
+// ═══════════════════════════════════════════════════════════════════════════
+let edges = datatable(src:string, edgeId:string, tgt:string, scope:string) [
+    // Attack paths to device50 (multi-hop)
+    'internet', 'e1', 'dmz-server', 'prod',  'dmz-server', 'e2', 'compromised-vm1', 'prod',
+    'compromised-vm1', 'e3', 'device50', 'prod',
+    'internet', 'e4', 'vpn-gateway', 'prod', 'vpn-gateway', 'e5', 'compromised-vm2', 'prod',
+    'compromised-vm2', 'e6', 'device50', 'prod',
+    'internet', 'e7', 'internet-facing', 'prod', 'internet-facing', 'e8', 'device50', 'prod',
+    // Attack paths to device49
+    'jump-host', 'e9', 'device49', 'prod', 'admin-workstation', 'e10', 'device49', 'prod',
+    // Low-risk paths
+    'workstation1', 'e11', 'device1', 'prod', 'workstation2', 'e12', 'device2', 'prod'
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 3: DEFINE NODES (exposure sources and target resources)
+// ═══════════════════════════════════════════════════════════════════════════
+let nodes = datatable(nodeId:string, nodeType:string, vuln:int, scope:string) [
+    'internet', 'external', 5, 'prod', 'dmz-server', 'server', 3, 'prod',
+    'vpn-gateway', 'gateway', 3, 'prod', 'internet-facing', 'server', 5, 'prod',
+    'compromised-vm1', 'vm', 4, 'prod', 'compromised-vm2', 'vm', 3, 'prod',
+    'jump-host', 'server', 2, 'prod', 'admin-workstation', 'workstation', 1, 'prod',
+    'workstation1', 'workstation', 1, 'prod', 'workstation2', 'workstation', 1, 'prod',
+    'device1', 'device', 0, 'prod', 'device2', 'device', 0, 'prod',
+    'device49', 'device', 0, 'prod', 'device50', 'device', 0, 'prod'
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 4: ML ALGEBRA - Find anomalous user-resource access (Collaborative Filtering)
+// ═══════════════════════════════════════════════════════════════════════════
+let anomalous_resources = AccessLogs
+    | invoke detect_anomalous_access_cf_fl('userName','deviceId','accountName','timeSlice',
+        trainStart, detectStart, detectStart + 2h)
+    | where isAnomalousAccess == 1
+    | project resource, entity, accessAnomalyScore;
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 5: ENRICH NODES - Mark exposure sources as starts, anomalous resources as ends
+// ═══════════════════════════════════════════════════════════════════════════
+let nodesEnriched = nodes
+    | extend IsValidStart = nodeType == 'external'  // Internet exposure sources
+    | extend IsValidEnd = nodeId in (anomalous_resources | project resource);
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 6: GRAPH ALGEBRA - Discover paths to flagged resources, calculate exposure
+// ═══════════════════════════════════════════════════════════════════════════
+graph_path_discovery_fl('edges', 'nodesEnriched', 'scope',
+    'IsValidStart', 'IsValidEnd', 'nodeId', 'edgeId', 'src', 'tgt')
+| invoke graph_exposure_perimeter_fl('sourceId', 'targetId')
+| project targetId, exposurePerimeterList, exposurePerimeterScore
+| order by exposurePerimeterScore desc
+
+
+/// Demo 4
+// ═══════════════════════════════════════════════════════════════════════════
+// THREAT INTELLIGENCE KNOWLEDGE BASE (with embeddings)
+// ═══════════════════════════════════════════════════════════════════════════
+let ThreatKB = datatable(docId:string, title:string, category:string, embedding:dynamic) [
+    "T1059.001", "PowerShell Execution", "technique",
+        dynamic([0.9, 0.8, 0.2, 0.1, 0.3, 0.7, 0.6, 0.4]),
+    "T1059.003", "Windows Command Shell", "technique",
+        dynamic([0.85, 0.75, 0.25, 0.15, 0.35, 0.65, 0.55, 0.45]),
+    "T1078", "Valid Accounts", "technique",
+        dynamic([0.3, 0.4, 0.9, 0.8, 0.2, 0.1, 0.5, 0.6]),
+    "T1486", "Data Encrypted for Impact", "technique",
+        dynamic([0.2, 0.3, 0.4, 0.5, 0.9, 0.85, 0.7, 0.6]),
+    "M1042", "Disable or Remove Feature", "mitigation",
+        dynamic([0.88, 0.78, 0.22, 0.12, 0.32, 0.68, 0.58, 0.42]),
+    "M1026", "Privileged Account Management", "mitigation",
+        dynamic([0.32, 0.42, 0.88, 0.78, 0.22, 0.12, 0.52, 0.62]),
+    "G0016", "APT29 - Cozy Bear", "threat_actor",
+        dynamic([0.7, 0.6, 0.5, 0.4, 0.6, 0.5, 0.8, 0.7]),
+    "G0032", "Lazarus Group", "threat_actor",
+        dynamic([0.4, 0.5, 0.6, 0.7, 0.8, 0.75, 0.65, 0.55])
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// KNOWLEDGE GRAPH RELATIONSHIPS
+// ═══════════════════════════════════════════════════════════════════════════
+let KnowledgeGraph = datatable(src:string, relationship:string, tgt:string) [
+    "G0016", "uses", "T1059.001",      // APT29 uses PowerShell
+    "G0016", "uses", "T1078",          // APT29 uses Valid Accounts
+    "G0032", "uses", "T1059.001",      // Lazarus uses PowerShell
+    "G0032", "uses", "T1486",          // Lazarus uses Ransomware
+    "T1059.001", "mitigated_by", "M1042",  // PowerShell mitigated by Disable Feature
+    "T1078", "mitigated_by", "M1026",      // Valid Accounts mitigated by PAM
+    "T1486", "mitigated_by", "M1026"       // Ransomware mitigated by PAM
+];
+// ═══════════════════════════════════════════════════════════════════════════
+// INCOMING ALERT EMBEDDING (e.g., from Azure OpenAI)
+// ═══════════════════════════════════════════════════════════════════════════
+let alertEmbedding = dynamic([0.92, 0.82, 0.18, 0.08, 0.28, 0.72, 0.62, 0.38]);
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH-RAG: Vector similarity INSIDE graph traversal
+// ═══════════════════════════════════════════════════════════════════════════
+KnowledgeGraph
+| make-graph src --> tgt with ThreatKB on docId
+| graph-match (entry)-[r*1..2]-(related)
+    where series_cosine_similarity(entry.embedding, alertEmbedding) > 0.95
+    project
+        SimilarityScore = series_cosine_similarity(entry.embedding, alertEmbedding),
+        EntryPoint = entry.['title'],
+        Relationship = r.relationship,
+        RelatedDoc = related.['title'],
+        RelatedCategory = related.category
+| order by SimilarityScore desc
